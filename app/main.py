@@ -17,6 +17,7 @@ from .imposition import (
     locate_defects,
     plan_reprint,
     press_layout,
+    staple_plan,
     UNREAD,
 )
 from .proof import (
@@ -42,8 +43,11 @@ app = FastAPI(
         "支持墨区着墨面积：页内矩形随页位 0°/180° 方向映射到纸面，跨等宽墨区"
         "按交叠面积拆分，按帖/张/正反面/墨区给出 CMYK 各通道等效着墨面积乘印数。"
         "支持双面拼版校样：按机台版面输出可下载的 proof.pdf。"
+        "支持骑马订针位规划：沿用相同分帖结果，在页高内整数毫米刻度上为每帖"
+        "选择递增针位，避开留边与禁针闭区间并满足最小针距，使相对理想针位的"
+        "最大绝对偏差最小（并列时依次取偏差总和最小、针位序列字典序最小）。"
     ),
-    version="1.7.0",
+    version="1.8.0",
 )
 
 
@@ -447,6 +451,152 @@ class ProofRequest(PressLayoutRequest):
         return self
 
 
+# ---------------------------------------------------------------------------
+# 骑马订针位规划 /api/v1/impose/staple-plan
+# ---------------------------------------------------------------------------
+
+
+class ForbiddenInterval(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    start_mm: float = Field(
+        ..., description="禁针区间起点（mm，闭区间下界），以页面顶边为 0、向下为正"
+    )
+    end_mm: float = Field(
+        ..., description="禁针区间终点（mm，闭区间上界），以页面顶边为 0、向下为正"
+    )
+
+    @field_validator("start_mm", "end_mm")
+    @classmethod
+    def validate_finite_interval(cls, value: float) -> float:
+        if not math.isfinite(value):
+            raise ValueError("禁针区间端点必须为有限数值（单位 mm）")
+        return value
+
+
+class SignatureForbiddenZones(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    signature_index: int = Field(
+        ..., ge=1, description="帖号，从 1 开始；同一帖号只能出现一次"
+    )
+    intervals: list[ForbiddenInterval] = Field(
+        ..., min_length=1, description="该帖的禁针闭区间列表，至少 1 个"
+    )
+
+    @field_validator("signature_index", mode="before")
+    @classmethod
+    def reject_non_integer_signature(cls, value):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError("帖号必须为整数（不接受布尔值或小数）")
+        return value
+
+
+class StaplePlanRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    total_pages: int = Field(
+        ..., ge=1, description="总页数，正整数（1, 2, 3, ...）"
+    )
+    max_sheets_per_signature: int = Field(
+        ..., ge=1, description="每帖最多纸张数，正整数；每帖最多容纳其 4 倍页数"
+    )
+    binding: Literal["left", "right"] = Field(
+        ..., description="装订方向：left=左装订，right=右装订"
+    )
+    page_height_mm: float = Field(
+        ..., description="页高（mm），50～1000 的有限数值"
+    )
+    staples_per_signature: int = Field(
+        ..., ge=2, le=4, description="每帖订针数，2～4 的整数"
+    )
+    top_margin_mm: float = Field(
+        ..., description="上留边（mm），非负有限数值；针位不得小于该值"
+    )
+    bottom_margin_mm: float = Field(
+        ..., description="下留边（mm），非负有限数值；针位不得大于 页高 − 下留边"
+    )
+    min_spacing_mm: float = Field(
+        ..., description="最小针距（mm），非负有限数值；相邻针位之差不小于该值"
+    )
+    forbidden_zones: list[SignatureForbiddenZones] = Field(
+        default_factory=list,
+        description="按帖号给出的禁针闭区间；缺省表示各帖均无禁区",
+    )
+
+    @field_validator("page_height_mm")
+    @classmethod
+    def validate_page_height(cls, value: float) -> float:
+        if not math.isfinite(value) or not 50.0 <= value <= 1000.0:
+            raise ValueError("页高必须为 50～1000 mm 的有限数值")
+        return value
+
+    @field_validator("staples_per_signature", mode="before")
+    @classmethod
+    def reject_non_integer_staples(cls, value):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError("每帖订针数必须为整数（不接受布尔值或小数）")
+        return value
+
+    @field_validator("top_margin_mm", "bottom_margin_mm", "min_spacing_mm")
+    @classmethod
+    def validate_non_negative_mm(cls, value: float) -> float:
+        if not math.isfinite(value) or value < 0:
+            raise ValueError("留边与最小针距必须为非负的有限数值（单位 mm）")
+        return value
+
+    @model_validator(mode="after")
+    def validate_staple_plan(self) -> "StaplePlanRequest":
+        # 禁针帖号越界/重复、区间非法与各帖可行性由 staple_plan 统一校验，
+        # 失败抛 ValueError -> 422；响应结果在端点内重新计算
+        staple_plan(
+            total_pages=self.total_pages,
+            max_sheets=self.max_sheets_per_signature,
+            binding=self.binding,
+            page_height_mm=self.page_height_mm,
+            staples_per_signature=self.staples_per_signature,
+            top_margin_mm=self.top_margin_mm,
+            bottom_margin_mm=self.bottom_margin_mm,
+            min_spacing_mm=self.min_spacing_mm,
+            forbidden_zones=[
+                (
+                    zone.signature_index,
+                    [
+                        (interval.start_mm, interval.end_mm)
+                        for interval in zone.intervals
+                    ],
+                )
+                for zone in self.forbidden_zones
+            ],
+        )
+        return self
+
+
+class StaplePlanSignature(BaseModel):
+    signature_index: int = Field(..., description="帖号，从 1 开始")
+    sheet_count: int = Field(..., description="本帖纸张数")
+    page_count_padded: int = Field(..., description="本帖补齐空白后的总页数（4 的倍数）")
+    staple_positions_mm: list[int] = Field(
+        ..., description="递增订针位置（整数 mm），以页面顶边为 0、向下为正"
+    )
+    max_deviation_mm: float = Field(
+        ..., description="本帖针位相对理想针位的最大绝对偏差（mm）"
+    )
+
+
+class StaplePlanResponse(BaseModel):
+    total_pages: int
+    max_sheets_per_signature: int
+    binding: Literal["left", "right"]
+    page_height_mm: float
+    staples_per_signature: int
+    top_margin_mm: float
+    bottom_margin_mm: float
+    min_spacing_mm: float
+    signature_count: int
+    signatures: list[StaplePlanSignature]
+
+
 class ChapterImpositionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -822,6 +972,33 @@ def create_proof_pdf(request: ProofRequest) -> Response:
         media_type="application/pdf",
         headers={"Content-Disposition": 'attachment; filename="proof.pdf"'},
     )
+
+
+@app.post(
+    "/api/v1/impose/staple-plan",
+    response_model=StaplePlanResponse,
+    tags=["拼版"],
+    summary="骑马订针位规划：整数毫米针位使最大偏差最小",
+)
+def create_staple_plan(request: StaplePlanRequest) -> StaplePlanResponse:
+    result = staple_plan(
+        total_pages=request.total_pages,
+        max_sheets=request.max_sheets_per_signature,
+        binding=request.binding,
+        page_height_mm=request.page_height_mm,
+        staples_per_signature=request.staples_per_signature,
+        top_margin_mm=request.top_margin_mm,
+        bottom_margin_mm=request.bottom_margin_mm,
+        min_spacing_mm=request.min_spacing_mm,
+        forbidden_zones=[
+            (
+                zone.signature_index,
+                [(interval.start_mm, interval.end_mm) for interval in zone.intervals],
+            )
+            for zone in request.forbidden_zones
+        ],
+    )
+    return StaplePlanResponse(**result)
 
 
 @app.post(

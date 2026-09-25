@@ -30,6 +30,12 @@
 `proof.pdf`——每张印张依次生成正面、背面两页，纸面尺寸与机台版面一致，各页位标注页码、帖号与张号，
 空白位标注“空白”，并画出中缝分隔线；长边 / 短边翻转的背面分别按槽位交换、旋转 180° 呈现。
 
+还提供**骑马订针位规划**接口 `/api/v1/impose/staple-plan`：沿用相同分帖结果，输入页高（50～1000 mm）、
+每帖订针数（2～4）、上/下留边、最小针距与按帖号给出的禁针闭区间（尺寸单位均为 mm），在页高内的
+整数毫米刻度上为每帖选择递增针位，避开留边与禁区并满足最小针距，使相对理想针位的最大绝对偏差最小
+（并列时依次取偏差总和最小、针位序列字典序最小），逐帖返回针位与最大偏差；某帖无可行排列时返回
+指出帖号的 `422`。
+
 ## 一条命令启动
 
 需要安装 Docker（含 Compose 插件），在项目根目录执行：
@@ -74,6 +80,7 @@ HOST_PORT=9000 docker compose up -d --build
 - 瑕疵定位接口：`POST http://localhost:8000/api/v1/impose/locate-defects`
 - 墨区着墨面积接口：`POST http://localhost:8000/api/v1/impose/ink-zones`
 - 双面拼版校样（PDF 下载）：`POST http://localhost:8000/api/v1/impose/proof.pdf`
+- 骑马订针位规划接口：`POST http://localhost:8000/api/v1/impose/staple-plan`
 
 ## 接口说明
 
@@ -862,6 +869,104 @@ curl -X POST http://localhost:8000/api/v1/impose/inspect \
 或实物页位为空字符串时，均返回 `422 Unprocessable Entity`。
 （页位缺字段或类型错误同样返回 422；空白页须显式传 `null`，未读出传 `"?"`。）
 
+## 骑马订针位规划（POST /api/v1/impose/staple-plan）
+
+沿用 `/api/v1/impose` 的**相同分帖结果**（帖数与各帖张数一致），为每帖规划骑马订的订针位置。
+本地访问地址 `http://localhost:8000/api/v1/impose/staple-plan`（改了 `HOST_PORT` 则对应替换端口）。
+
+### 请求
+
+`POST /api/v1/impose/staple-plan`，`Content-Type: application/json`
+
+| 字段 | 类型 | 约束 | 说明 |
+| --- | --- | --- | --- |
+| `total_pages` | 整数 | ≥ 1 | 总页数（正整数） |
+| `max_sheets_per_signature` | 整数 | ≥ 1 | 每帖最多纸张数；每帖最多容纳其 **4 倍**页数 |
+| `binding` | 字符串 | `left` / `right` | 装订方向：左装订 / 右装订 |
+| `page_height_mm` | 数值 | 50～1000、有限值 | 页高（mm） |
+| `staples_per_signature` | 整数 | 2～4 | 每帖订针数 |
+| `top_margin_mm` | 数值 | ≥ 0、有限值 | 上留边（mm）；针位不得小于该值 |
+| `bottom_margin_mm` | 数值 | ≥ 0、有限值 | 下留边（mm）；针位不得大于 `页高 − 下留边` |
+| `min_spacing_mm` | 数值 | ≥ 0、有限值 | 最小针距（mm）；相邻针位之差不得小于该值 |
+| `forbidden_zones` | 对象数组 | 可缺省（默认无禁区） | 按帖号给出的禁针闭区间；同一帖号只能出现一次 |
+| `forbidden_zones[].signature_index` | 整数 | 1～帖数 | 帖号，从 1 开始 |
+| `forbidden_zones[].intervals` | 对象数组 | 非空 | 该帖的禁针闭区间列表 |
+| `intervals[].start_mm` / `end_mm` | 数值 | 有限值，`0 ≤ start ≤ end ≤ 页高` | 禁针闭区间端点（mm），以页面顶边为 0、向下为正 |
+
+```bash
+curl -X POST http://localhost:8000/api/v1/impose/staple-plan \
+  -H "Content-Type: application/json" \
+  -d '{
+    "total_pages": 16,
+    "max_sheets_per_signature": 4,
+    "binding": "left",
+    "page_height_mm": 297,
+    "staples_per_signature": 2,
+    "top_margin_mm": 10,
+    "bottom_margin_mm": 10,
+    "min_spacing_mm": 50,
+    "forbidden_zones": [
+      {"signature_index": 1, "intervals": [{"start_mm": 100, "end_mm": 105}]}
+    ]
+  }'
+```
+
+### 针位规则
+
+- **坐标**：针位以页面顶边为 0、向下为正（mm），限页高内的**整数毫米刻度**；须避开上/下留边
+  （可行闭区间 `[top_margin_mm, 页高 − bottom_margin_mm]`，边界允许）与该帖的禁针闭区间
+  （闭区间内不含任何整数刻度时不产生影响）。
+- **理想针位**：第 i 个（i = 1..订针数）理想针位为
+  `上留边 + i × (页高 − 上留边 − 下留边) / (订针数 + 1)`。
+- **相邻针距**：递增针位相邻之差不得小于 `min_spacing_mm`（整数刻度天然至少相距 1 mm）。
+- **优化目标**：每帖独立选择递增针位，依次最小化——
+  1. 各针位相对理想针位的**最大绝对偏差**；
+  2. 并列时取**偏差总和**最小；
+  3. 仍并列时取**针位序列字典序**最小。
+
+### 响应
+
+逐帖返回 `staple_positions_mm`（递增整数针位）与 `max_deviation_mm`（最大绝对偏差），
+并回显请求参数；`signature_count` / `sheet_count` / `page_count_padded` 与 `/api/v1/impose` 一致。
+
+上例（页高 297、上下留边各 10、2 针，理想针位 ≈ 102.33 / 194.67；第 1 帖禁针 [100, 105]，
+故第一针取 99）响应：
+
+```json
+{
+  "total_pages": 16,
+  "max_sheets_per_signature": 4,
+  "binding": "left",
+  "page_height_mm": 297.0,
+  "staples_per_signature": 2,
+  "top_margin_mm": 10.0,
+  "bottom_margin_mm": 10.0,
+  "min_spacing_mm": 50.0,
+  "signature_count": 1,
+  "signatures": [
+    {
+      "signature_index": 1,
+      "sheet_count": 4,
+      "page_count_padded": 16,
+      "staple_positions_mm": [99, 195],
+      "max_deviation_mm": 3.3333333333333335
+    }
+  ]
+}
+```
+
+### 非法参数（4xx）
+
+- 与 `/api/v1/impose` 相同的校验（`total_pages` / `max_sheets_per_signature` / `binding`、
+  未定义字段等）；
+- `page_height_mm` 不在 50～1000 或为非有限值（`NaN` / `Infinity`）、`staples_per_signature`
+  不在 2～4（或非整数）、留边 / 最小针距为负或非有限值；
+- 禁针区间帖号无效（小于 1 或超过帖数）、同一帖号重复给出、区间列表为空、起点大于终点、
+  区间越出 `[0, 页高]` 或含非有限值；
+- **某帖无可行排列**（留边 / 禁针 / 最小针距约束下排不出满足条件的递增针位）；
+
+以上均返回 `422 Unprocessable Entity`，无可行排列时错误信息指出对应帖号。
+
 ## 本地开发（不使用 Docker）
 
 ```bash
@@ -877,7 +982,7 @@ pytest -q
 .
 ├── app/
 │   ├── __init__.py
-│   ├── imposition.py   # 拼版核心算法（分帖 + 帖内拼版 + 机台版面 + 瑕疵定位 + 墨区着墨面积）
+│   ├── imposition.py   # 拼版核心算法（分帖 + 帖内拼版 + 机台版面 + 瑕疵定位 + 墨区着墨面积 + 订针位规划）
 │   ├── proof.py        # 双面拼版校样 PDF 生成（沿用机台版面结果）
 │   ├── fonts/          # 校样 PDF 嵌入的子集化中文字体
 │   └── main.py         # FastAPI 路由与参数校验

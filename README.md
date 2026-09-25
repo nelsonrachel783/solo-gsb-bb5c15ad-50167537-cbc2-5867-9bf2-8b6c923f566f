@@ -30,6 +30,11 @@
 `proof.pdf`——每张印张依次生成正面、背面两页，纸面尺寸与机台版面一致，各页位标注页码、帖号与张号，
 空白位标注“空白”，并画出中缝分隔线；长边 / 短边翻转的背面分别按槽位交换、旋转 180° 呈现。
 
+还提供**订针计划**接口 `/api/v1/impose/staple-plan`：沿用 `/api/v1/impose` 的帖数与每帖张数，
+接收页高（50～1000 mm）、每帖订针数（2～4 根）、上/下留边、最小针距以及按帖号给出的禁针闭区间，
+在页高内的整数毫米刻度上为每帖规划递增针位，使相对理想针位的最大绝对偏差最小
+（并列时先比偏差总和、再比针位序列字典序），逐帖返回针位与最大偏差；某帖无可行排列时返回指出帖号的 422。
+
 ## 一条命令启动
 
 需要安装 Docker（含 Compose 插件），在项目根目录执行：
@@ -74,6 +79,7 @@ HOST_PORT=9000 docker compose up -d --build
 - 瑕疵定位接口：`POST http://localhost:8000/api/v1/impose/locate-defects`
 - 墨区着墨面积接口：`POST http://localhost:8000/api/v1/impose/ink-zones`
 - 双面拼版校样（PDF 下载）：`POST http://localhost:8000/api/v1/impose/proof.pdf`
+- 订针计划接口：`POST http://localhost:8000/api/v1/impose/staple-plan`
 
 ## 接口说明
 
@@ -548,8 +554,111 @@ curl -X POST http://localhost:8000/api/v1/impose/proof.pdf \
   超过 100 张时返回 `422 Unprocessable Entity`，并在错误信息中给出本次张数与页数。
   400 页（恰好 100 张）仍可正常下载。
 
-## 章节分帖拼版（POST /api/v1/impose/chapters）
+## 订针计划（POST /api/v1/impose/staple-plan）
 
+在 `/api/v1/impose` 的**相同分帖结果**（帖数、每帖张数与末帖补白）之上，为每个帖规划骑马订订针的
+整数毫米针位，用于装订工序下针。针位规划只取决于页高与禁针要求，与装订方向无关（`binding` 仍照常传入）。
+本地访问地址 `http://localhost:8000/api/v1/impose/staple-plan`（改了 `HOST_PORT` 则对应替换端口）。
+
+### 请求
+
+`POST /api/v1/impose/staple-plan`，`Content-Type: application/json`
+
+| 字段 | 类型 | 约束 | 说明 |
+| --- | --- | --- | --- |
+| `total_pages` | 整数 | ≥ 1 | 总页数（正整数），沿用普通拼版的分帖参数 |
+| `max_sheets_per_signature` | 整数 | ≥ 1 | 每帖最多纸张数；每帖最多容纳其 **4 倍**页数 |
+| `binding` | 字符串 | `left` / `right` | 装订方向：左装订 / 右装订 |
+| `page_height_mm` | 数值 | 50～1000（有限值） | 页高（mm） |
+| `staple_count` | 整数 | 2～4 | 每帖订针数（严格整数，不接受小数/布尔值） |
+| `top_margin_mm` | 数值 | ≥ 0（有限值） | 上留边（mm）；上留边 + 下留边须**小于**页高 |
+| `bottom_margin_mm` | 数值 | ≥ 0（有限值） | 下留边（mm）；上留边 + 下留边须**小于**页高 |
+| `min_spacing_mm` | 数值 | ≥ 0（有限值） | 相邻订针的最小针距（mm） |
+| `forbidden_zones` | 对象数组 | 允许为空（可省略） | 按帖号给出的**禁针闭区间**；无禁针要求的帖无需给出 |
+| `forbidden_zones[].signature_index` | 整数 | 1～帖数，每帖至多 1 项 | 帖号，从 1 开始 |
+| `forbidden_zones[].intervals` | 对象数组 | 非空 | 该帖禁针闭区间 `[start_mm, end_mm]` 列表 |
+| `intervals[].start_mm` / `end_mm` | 数值 | `0 ≤ start ≤ end ≤ 页高` | 禁针闭区间端点（mm），以**页顶为原点**、向下为正 |
+
+```bash
+curl -X POST http://localhost:8000/api/v1/impose/staple-plan \
+  -H "Content-Type: application/json" \
+  -d '{
+    "total_pages": 8,
+    "max_sheets_per_signature": 4,
+    "binding": "left",
+    "page_height_mm": 100,
+    "staple_count": 3,
+    "top_margin_mm": 14,
+    "bottom_margin_mm": 14,
+    "min_spacing_mm": 10,
+    "forbidden_zones": [
+      {"signature_index": 1,
+       "intervals": [{"start_mm": 40, "end_mm": 42}, {"start_mm": 88, "end_mm": 92}]}
+    ]
+  }'
+```
+
+### 针位规划规则
+
+- **整数毫米刻度**：订针位置限于页高 `0..page_height_mm` 内的整数毫米刻度
+  （页高非整数时，取到不超过页高的刻度为止），以页顶为原点、向下为正。
+- **避开留边**：针位严格满足 `上留边 < y < 页高 − 下留边`（留边边界上的刻度不可下针）；
+  上下留边为 0 时，页高两端的刻度（0 与页高）同样不可下针。
+- **避开禁区**：针位不得落在任一禁针**闭区间** `[start_mm, end_mm]` 内——
+  与端点重合的整数刻度同样禁针；禁区只作用于指定的帖，其他帖不受影响。
+- **最小针距**：同帖针位自上而下严格递增，相邻针距（`p[i+1] − p[i]`）不小于 `min_spacing_mm`。
+- **理想针位**：第 `i` 个（`i = 1..staple_count`）理想针位为
+
+  ```
+  上留边 + i × (页高 − 上留边 − 下留边) / (订针数 + 1)
+  ```
+
+- **择优顺序**：在全部可行的递增针位序列中，依次
+  1. **最小化最大绝对偏差**（max_i |p[i] − 理想针位[i]|）；
+  2. 并列时**最小化偏差总和**（Σ|p[i] − 理想针位[i]|）；
+  3. 仍并列时取**针位序列字典序最小**（自上而下逐位比较，首位可小则小）。
+
+### 响应
+
+逐帖返回 `signature_index`、沿用普通拼版的 `sheet_count` / `page_count_padded`，以及
+`staple_positions_mm`（自上而下递增的整数毫米针位）与 `max_deviation_mm`（本帖最大绝对偏差）。
+
+上例（页高 100、上下留边各 14、订 3 针，理想针位恰为 32/50/68；禁区未覆盖这三个刻度）响应：
+
+```json
+{
+  "total_pages": 8,
+  "max_sheets_per_signature": 4,
+  "binding": "left",
+  "page_height_mm": 100.0,
+  "staple_count": 3,
+  "top_margin_mm": 14.0,
+  "bottom_margin_mm": 14.0,
+  "min_spacing_mm": 10.0,
+  "signature_count": 1,
+  "signatures": [
+    {
+      "signature_index": 1,
+      "sheet_count": 2,
+      "page_count_padded": 8,
+      "staple_positions_mm": [32, 50, 68],
+      "max_deviation_mm": 0.0
+    }
+  ]
+}
+```
+
+### 非法参数与无可行排列（4xx）
+
+- 分帖参数非法（`total_pages` / `max_sheets_per_signature` 小于 1、`binding` 取值非法等）；
+- 页高不在 50～1000、`staple_count` 不在 2～4 或不是整数、留边/最小针距为负或非有限值、
+  上下留边之和不小于页高；
+- 禁针区间帖号超出实际帖数、同一帖号重复给出、区间端点为负、`start > end` 或超出页高；
+- **某帖无可行排列**（如可用刻度全部落入禁区、或任意两个合法刻度的间距都小于最小针距）：
+  返回 `422 Unprocessable Entity`，错误信息指出帖号，例如
+  `Value error, 第 2 帖无可行订针排列`。
+
+## 章节分帖拼版（POST /api/v1/impose/chapters）
 在 `/api/v1/impose` 的基础上支持**章节感知**分帖：章节不可跨帖，相邻章节可合帖。
 本地访问地址 `http://localhost:8000/api/v1/impose/chapters`（改了 `HOST_PORT` 则对应替换端口）。
 
@@ -877,7 +986,7 @@ pytest -q
 .
 ├── app/
 │   ├── __init__.py
-│   ├── imposition.py   # 拼版核心算法（分帖 + 帖内拼版 + 机台版面 + 瑕疵定位 + 墨区着墨面积）
+│   ├── imposition.py   # 拼版核心算法（分帖 + 帖内拼版 + 机台版面 + 瑕疵定位 + 墨区着墨面积 + 订针计划）
 │   ├── proof.py        # 双面拼版校样 PDF 生成（沿用机台版面结果）
 │   ├── fonts/          # 校样 PDF 嵌入的子集化中文字体
 │   └── main.py         # FastAPI 路由与参数校验

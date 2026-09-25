@@ -1112,3 +1112,306 @@ def inspect_observed_sheets(
         "unmatched_observations": unmatched_observations,
         "unseen_signatures": unseen_signatures,
     }
+
+
+# ---------------------------------------------------------------------------
+# 订针计划（staple-plan）：在既有分帖结果上逐帖规划订针整数毫米针位
+# ---------------------------------------------------------------------------
+
+# 页高允许范围、每帖订针数允许范围
+STAPLE_PAGE_HEIGHT_MIN_MM = 50
+STAPLE_PAGE_HEIGHT_MAX_MM = 1000
+STAPLE_COUNT_MIN = 2
+STAPLE_COUNT_MAX = 4
+
+# 针位均为整数毫米刻度，最小离散误差即 0.5 mm；浮点比较取远小于该量级的
+# 容差，仅用于抵消理想针位浮点运算引入的 ULP 级偏差（如并列偏差因舍入路径
+# 不同相差 1 ULP 时仍按并列处理），不改变任何离散刻度上的真实优劣
+STAPLE_EPS = 1e-9
+
+# 某帖的禁针闭区间：(起点, 终点)，均以页顶为原点、向下为正，单位 mm
+StapleForbiddenInterval = Tuple[float, float]
+
+
+def _staple_allowed_ticks(
+    page_height_mm: float,
+    top_margin_mm: float,
+    bottom_margin_mm: float,
+    forbidden: List[StapleForbiddenInterval],
+) -> List[int]:
+    """页高内可下针的整数毫米刻度（避开上/下留边与全部禁针闭区间）。"""
+    ticks: List[int] = []
+    # range 上界含 page_height_mm 本身，再由严格不等式排除边界
+    for tick in range(1, int(math.floor(page_height_mm)) + 1):
+        if not (top_margin_mm < tick < page_height_mm - bottom_margin_mm):
+            continue
+        if any(lo <= tick <= hi for lo, hi in forbidden):
+            continue
+        ticks.append(tick)
+    return ticks
+
+
+def _plan_staple_signature(
+    page_height_mm: float,
+    top_margin_mm: float,
+    bottom_margin_mm: float,
+    min_spacing_mm: float,
+    staple_count: int,
+    forbidden: List[StapleForbiddenInterval],
+) -> Tuple[List[int], float]:
+    """为单个帖规划递增针位。
+
+    第 i（1-based）个理想针位为
+    ``上留边 + i × (页高 − 上留边 − 下留边) / (订针数 + 1)``；
+    在所有可行的递增整数毫米针位序列（避开留边、禁针闭区间，相邻针距不小于
+    下限）中，依次最小化：最大绝对偏差 → 偏差总和 → 针位序列字典序。
+
+    返回 (针位列表, 最大绝对偏差 mm)。无可行排列时抛 ValueError。
+    """
+    ticks = _staple_allowed_ticks(
+        page_height_mm, top_margin_mm, bottom_margin_mm, forbidden
+    )
+    usable = page_height_mm - top_margin_mm - bottom_margin_mm
+    ideals = [
+        top_margin_mm + i * usable / (staple_count + 1)
+        for i in range(1, staple_count + 1)
+    ]
+    # 每个可用刻度相对各理想针位的偏差矩阵：deviation_matrix[i][j] 为第 i 根
+    # 针（自顶向下，从 0 计）落在 ticks[j] 时的绝对偏差
+    deviation_matrix = [
+        [abs(tick - ideal) for tick in ticks] for ideal in ideals
+    ]
+
+    def feasible_common(max_dev: float) -> bool:
+        """各针偏差均不超过 max_dev（容差 STAPLE_EPS）时，能否自顶向下放下
+        staple_count 根针。
+
+        针位按针序逐根匹配：只要上一根已落在当前刻度之前（满足最小针距），
+        当前刻度即可服务于下一根针；全部针都能落下即可行。
+        """
+        chosen = 0
+        last: Optional[int] = None
+        for j, tick in enumerate(ticks):
+            if last is not None and tick - last < min_spacing_mm:
+                continue
+            if deviation_matrix[chosen][j] <= max_dev + STAPLE_EPS:
+                chosen += 1
+                last = tick
+                if chosen == staple_count:
+                    return True
+        return False
+
+    if not feasible_common(math.inf):
+        raise ValueError("无可行订针排列")
+
+    # 第 1 级目标：最小化最大绝对偏差。候选上限取实际可达偏差值，二分贪心
+    candidates = sorted(
+        {
+            deviation_matrix[i][j]
+            for i in range(staple_count)
+            for j in range(len(ticks))
+        }
+    )
+    lo, hi = 0, len(candidates) - 1
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if feasible_common(candidates[mid]):
+            hi = mid
+        else:
+            lo = mid + 1
+    optimal_max_dev = candidates[lo]
+
+    # 偏差按 STAPLE_EPS 量化成整数“档级”比较：仅抵消理想针位浮点运算的
+    # ULP 级差异（数学上相等的并列偏差不因舍入路径不同被误判优劣），
+    # 离散刻度间 ≥ 1 mm 的真实差异远大量化误差，不受影响
+    def level(dev: float) -> int:
+        return int(round(dev / STAPLE_EPS))
+
+    # 第 2/3 级目标：在最大偏差不超过最优上限的前提下，DP 最小化
+    # (偏差总和档级, 针位序列字典序)。dp[j] = 当前针落在 ticks[j] 的最优状态，
+    # 元组 (偏差总和档级, 针位元组) 直接按目标顺序比较；针位元组随前缀增长，
+    # 天然实现字典序裁决。
+    INF_STATE: Optional[Tuple[int, Tuple[int, ...]]] = None
+    dp: List[Optional[Tuple[int, Tuple[int, ...]]]] = [None] * len(ticks)
+    for j, tick in enumerate(ticks):
+        if deviation_matrix[0][j] <= optimal_max_dev + STAPLE_EPS:
+            dp[j] = (level(deviation_matrix[0][j]), (tick,))
+    for needle in range(1, staple_count):
+        ndp: List[Optional[Tuple[int, Tuple[int, ...]]]] = [
+            None
+        ] * len(ticks)
+        best: Optional[Tuple[int, Tuple[int, ...]]] = None
+        p = 0
+        for j, tick in enumerate(ticks):
+            # 纳入所有 ticks[p] <= tick - min_spacing 的前驱，保留最优
+            while p < j and ticks[p] <= tick - min_spacing_mm:
+                if dp[p] is not None and (best is None or dp[p] < best):
+                    best = dp[p]
+                p += 1
+            if (
+                best is not None
+                and deviation_matrix[needle][j] <= optimal_max_dev + STAPLE_EPS
+            ):
+                ndp[j] = (
+                    best[0] + level(deviation_matrix[needle][j]),
+                    best[1] + (tick,),
+                )
+        dp = ndp
+
+    final_best: Optional[Tuple[int, Tuple[int, ...]]] = INF_STATE
+    for state in dp:
+        if state is not None and (final_best is None or state < final_best):
+            final_best = state
+    if final_best is None:  # pragma: no cover - 二分已保证可行
+        raise ValueError("无可行订针排列")
+    positions = list(final_best[1])
+    # 返回的最大偏差取所选排列的真实值（可能与最优上限仅差 ULP 级舍入）
+    actual_max_dev = max(
+        abs(position - ideal) for position, ideal in zip(positions, ideals)
+    )
+    return positions, actual_max_dev
+
+
+def staple_plan(
+    total_pages: int,
+    max_sheets: int,
+    binding: Binding,
+    page_height_mm: float,
+    staple_count: int,
+    top_margin_mm: float,
+    bottom_margin_mm: float,
+    min_spacing_mm: float,
+    forbidden_by_signature: List[Tuple[int, List[StapleForbiddenInterval]]],
+) -> dict:
+    """沿用 :func:`impose` 的分帖结果，逐帖规划订针针位。
+
+    订针位置限于页高 ``0..page_height_mm`` 内的**整数毫米刻度**，须严格避开
+    上/下留边（``top_margin_mm < y < 页高 − bottom_margin_mm``）与按帖号给出
+    的禁针闭区间；同一帖内针位严格递增，相邻针距不小于 ``min_spacing_mm``。
+
+    每帖在可行排列中依次最小化：最大绝对偏差 → 偏差总和 → 针位序列字典序；
+    理想针位见 :func:`_plan_staple_signature`。任一帖无可行排列时抛
+    ``ValueError``，错误信息指出帖号。
+
+    禁针区间按帖号（从 1 开始）给出；同一帖号只能出现一次，区间须为
+    ``0 ≤ 起点 ≤ 终点 ≤ 页高`` 的有限数值，帖号超出实际帖数同样报错。
+    """
+    if binding not in ("left", "right"):
+        raise ValueError(f"非法装订方向：{binding!r}，只支持 'left' / 'right'")
+    if (
+        not isinstance(page_height_mm, (int, float))
+        or isinstance(page_height_mm, bool)
+        or not math.isfinite(page_height_mm)
+        or not (
+            STAPLE_PAGE_HEIGHT_MIN_MM <= page_height_mm <= STAPLE_PAGE_HEIGHT_MAX_MM
+        )
+    ):
+        raise ValueError(
+            f"页高必须为 {STAPLE_PAGE_HEIGHT_MIN_MM}～"
+            f"{STAPLE_PAGE_HEIGHT_MAX_MM} mm 的有限数值"
+        )
+    if (
+        not isinstance(staple_count, int)
+        or isinstance(staple_count, bool)
+        or not (STAPLE_COUNT_MIN <= staple_count <= STAPLE_COUNT_MAX)
+    ):
+        raise ValueError(
+            f"每帖订针数必须为 {STAPLE_COUNT_MIN}～{STAPLE_COUNT_MAX} 的整数"
+        )
+    for name, value in (
+        ("上留边", top_margin_mm),
+        ("下留边", bottom_margin_mm),
+        ("最小针距", min_spacing_mm),
+    ):
+        if (
+            not isinstance(value, (int, float))
+            or isinstance(value, bool)
+            or not math.isfinite(value)
+            or value < 0
+        ):
+            raise ValueError(f"{name}必须为非负有限数值（单位 mm）")
+    if top_margin_mm + bottom_margin_mm >= page_height_mm:
+        raise ValueError("上留边与下留边之和必须小于页高")
+
+    signatures = impose(total_pages, max_sheets, binding)
+    signature_total = len(signatures)
+    forbidden_map: dict = {}
+    for order, (signature_index, intervals) in enumerate(
+        forbidden_by_signature, start=1
+    ):
+        if (
+            not isinstance(signature_index, int)
+            or isinstance(signature_index, bool)
+            or not 1 <= signature_index <= signature_total
+        ):
+            raise ValueError(
+                f"第 {order} 组禁针区间的帖号 {signature_index!r} 无效："
+                f"共 {signature_total} 帖"
+            )
+        if signature_index in forbidden_map:
+            raise ValueError(f"第 {signature_index} 帖的禁针区间重复给出，每帖只能出现一次")
+        normalized: List[StapleForbiddenInterval] = []
+        for interval_index, interval in enumerate(intervals, start=1):
+            if len(interval) != 2:
+                raise ValueError(
+                    f"第 {signature_index} 帖第 {interval_index} 个禁针区间字段不完整"
+                )
+            lo, hi = interval
+            if not all(
+                isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+                for v in (lo, hi)
+            ):
+                raise ValueError(
+                    f"第 {signature_index} 帖第 {interval_index} 个禁针区间"
+                    "必须为有限数值（单位 mm）"
+                )
+            if not (0 <= lo <= hi <= page_height_mm):
+                raise ValueError(
+                    f"第 {signature_index} 帖第 {interval_index} 个禁针区间"
+                    f" [{lo}, {hi}] 非法：须满足 0 ≤ 起点 ≤ 终点 ≤ 页高"
+                    f"（{page_height_mm} mm）"
+                )
+            normalized.append((float(lo), float(hi)))
+        forbidden_map[signature_index] = tuple(normalized)
+
+    result_signatures: List[dict] = []
+    # 禁针区间相同的帖（含均无禁区的多数帖）规划结果一致，缓存复用
+    plan_cache: dict = {}
+    for signature in signatures:
+        index = signature["signature_index"]
+        key = forbidden_map.get(index, ())
+        if key not in plan_cache:
+            try:
+                plan_cache[key] = _plan_staple_signature(
+                    page_height_mm=page_height_mm,
+                    top_margin_mm=top_margin_mm,
+                    bottom_margin_mm=bottom_margin_mm,
+                    min_spacing_mm=min_spacing_mm,
+                    staple_count=staple_count,
+                    forbidden=list(key),
+                )
+            except ValueError:
+                raise ValueError(f"第 {index} 帖无可行订针排列") from None
+        positions, max_deviation = plan_cache[key]
+        result_signatures.append(
+            {
+                "signature_index": index,
+                "sheet_count": signature["sheet_count"],
+                "page_count_padded": signature["page_count_padded"],
+                "staple_positions_mm": positions,
+                "max_deviation_mm": max_deviation,
+            }
+        )
+
+    return {
+        "total_pages": total_pages,
+        "max_sheets_per_signature": max_sheets,
+        "binding": binding,
+        "page_height_mm": page_height_mm,
+        "staple_count": staple_count,
+        "top_margin_mm": top_margin_mm,
+        "bottom_margin_mm": bottom_margin_mm,
+        "min_spacing_mm": min_spacing_mm,
+        "signature_count": signature_total,
+        "signatures": result_signatures,
+    }

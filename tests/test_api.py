@@ -1650,3 +1650,205 @@ def test_ink_zones_missing_field_returns_422():
     }
     response = client.post("/api/v1/impose/ink-zones", json=body)
     assert response.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# 订针计划 /api/v1/impose/staple-plan
+# ---------------------------------------------------------------------------
+
+STAPLE_PLAN_BASE = {
+    "total_pages": 8,
+    "max_sheets_per_signature": 4,
+    "binding": "left",
+    "page_height_mm": 100.0,
+    "staple_count": 3,
+    "top_margin_mm": 14.0,
+    "bottom_margin_mm": 14.0,
+    "min_spacing_mm": 10.0,
+}
+
+
+def test_staple_plan_exact_ideals():
+    response = client.post("/api/v1/impose/staple-plan", json=STAPLE_PLAN_BASE)
+    assert response.status_code == 200
+    data = response.json()
+    # 8 页、每帖最多 4 张 -> 1 帖 2 张
+    assert data["signature_count"] == 1
+    sig = data["signatures"][0]
+    assert sig["signature_index"] == 1
+    assert sig["sheet_count"] == 2
+    assert sig["page_count_padded"] == 8
+    # 可用高 72，订 3 针：32/50/68 恰为整数毫米理想针位
+    assert sig["staple_positions_mm"] == [32, 50, 68]
+    assert sig["max_deviation_mm"] == 0.0
+
+
+def test_staple_plan_forbidden_zones_only_affect_named_signature():
+    body = {
+        **STAPLE_PLAN_BASE,
+        "total_pages": 6,
+        "max_sheets_per_signature": 1,
+        "staple_count": 2,
+        "top_margin_mm": 10.0,
+        "bottom_margin_mm": 10.0,
+        "forbidden_zones": [
+            {"signature_index": 2, "intervals": [{"start_mm": 30, "end_mm": 30}]},
+        ],
+    }
+    response = client.post("/api/v1/impose/staple-plan", json=body)
+    assert response.status_code == 200
+    sigs = response.json()["signatures"]
+    assert len(sigs) == 2
+    # 第 1 帖无禁区：理想针位 36.67/63.33 -> 37/63
+    assert sigs[0]["staple_positions_mm"] == [37, 63]
+    # 第 2 帖刻度 30 为闭区间端点，同样禁针
+    assert 30 not in sigs[1]["staple_positions_mm"]
+    assert all(len(s["staple_positions_mm"]) == 2 for s in sigs)
+
+
+def test_staple_plan_min_spacing_tiebreak_example():
+    # 禁区 [20,30] + 最小针距 50：[19,69] 与 [31,81] 最大偏差、偏差总和相同，
+    # 取针位序列字典序最小者
+    body = {
+        **STAPLE_PLAN_BASE,
+        "staple_count": 2,
+        "top_margin_mm": 10.0,
+        "bottom_margin_mm": 10.0,
+        "min_spacing_mm": 50.0,
+        "forbidden_zones": [
+            {"signature_index": 1, "intervals": [{"start_mm": 20, "end_mm": 30}]},
+        ],
+    }
+    response = client.post("/api/v1/impose/staple-plan", json=body)
+    assert response.status_code == 200
+    sig = response.json()["signatures"][0]
+    assert sig["staple_positions_mm"] == [19, 69]
+    assert sig["max_deviation_mm"] == pytest.approx(53 / 3, abs=1e-9)
+
+
+def test_staple_plan_infeasible_signature_returns_422_with_index():
+    body = {
+        **STAPLE_PLAN_BASE,
+        "total_pages": 6,
+        "max_sheets_per_signature": 1,
+        "staple_count": 2,
+        "top_margin_mm": 10.0,
+        "bottom_margin_mm": 10.0,
+        "min_spacing_mm": 50.0,
+        "forbidden_zones": [
+            {"signature_index": 2, "intervals": [{"start_mm": 20, "end_mm": 89}]},
+        ],
+    }
+    response = client.post("/api/v1/impose/staple-plan", json=body)
+    assert response.status_code == 422
+    assert "第 2 帖" in response.json()["detail"][0]["msg"]
+
+
+def test_staple_plan_infeasible_by_spacing_returns_422():
+    # 可用高 80 mm 却要求最小针距 80
+    body = {
+        **STAPLE_PLAN_BASE,
+        "staple_count": 2,
+        "top_margin_mm": 10.0,
+        "bottom_margin_mm": 10.0,
+        "min_spacing_mm": 80.0,
+    }
+    response = client.post("/api/v1/impose/staple-plan", json=body)
+    assert response.status_code == 422
+    assert "第 1 帖" in response.json()["detail"][0]["msg"]
+
+
+def test_staple_plan_page_height_boundaries():
+    for height in (50, 1000):
+        body = {**STAPLE_PLAN_BASE, "page_height_mm": height,
+                "top_margin_mm": 5.0, "bottom_margin_mm": 5.0,
+                "min_spacing_mm": 5.0}
+        response = client.post("/api/v1/impose/staple-plan", json=body)
+        assert response.status_code == 200
+    for height in (49, 1001):
+        body = {**STAPLE_PLAN_BASE, "page_height_mm": height}
+        assert client.post("/api/v1/impose/staple-plan", json=body).status_code == 422
+
+
+def test_staple_plan_count_boundaries_and_integer_only():
+    for count in (2, 3, 4):
+        body = {**STAPLE_PLAN_BASE, "staple_count": count}
+        assert client.post("/api/v1/impose/staple-plan", json=body).status_code == 200
+    for count in (1, 5, 2.0, 3.5, True):
+        body = {**STAPLE_PLAN_BASE, "staple_count": count}
+        assert client.post("/api/v1/impose/staple-plan", json=body).status_code == 422
+
+
+def test_staple_plan_margin_and_spacing_validation():
+    for override in (
+        {"top_margin_mm": -0.1},
+        {"bottom_margin_mm": -1},
+        {"min_spacing_mm": -1},
+        {"top_margin_mm": 87, "bottom_margin_mm": 13},  # 留边之和 >= 页高
+    ):
+        body = {**STAPLE_PLAN_BASE, **override}
+        assert client.post("/api/v1/impose/staple-plan", json=body).status_code == 422
+
+
+def test_staple_plan_forbidden_zone_validation():
+    for intervals in (
+        [{"start_mm": -1, "end_mm": 5}],
+        [{"start_mm": 80, "end_mm": 50}],
+        [{"start_mm": 1, "end_mm": 101}],
+    ):
+        body = {
+            **STAPLE_PLAN_BASE,
+            "forbidden_zones": [{"signature_index": 1, "intervals": intervals}],
+        }
+        assert client.post("/api/v1/impose/staple-plan", json=body).status_code == 422
+    # intervals 不能为空
+    body = {
+        **STAPLE_PLAN_BASE,
+        "forbidden_zones": [{"signature_index": 1, "intervals": []}],
+    }
+    assert client.post("/api/v1/impose/staple-plan", json=body).status_code == 422
+    # 帖号超出实际帖数、同帖重复给出
+    for zones in (
+        [{"signature_index": 2, "intervals": [{"start_mm": 1, "end_mm": 2}]}],
+        [
+            {"signature_index": 1, "intervals": [{"start_mm": 1, "end_mm": 2}]},
+            {"signature_index": 1, "intervals": [{"start_mm": 3, "end_mm": 4}]},
+        ],
+    ):
+        body = {**STAPLE_PLAN_BASE, "forbidden_zones": zones}
+        assert client.post("/api/v1/impose/staple-plan", json=body).status_code == 422
+
+
+def test_staple_plan_non_finite_dimensions_return_422():
+    payload = (
+        '{"total_pages": 8, "max_sheets_per_signature": 4, "binding": "left", '
+        '"page_height_mm": 100, "staple_count": 2, "top_margin_mm": 10, '
+        '"bottom_margin_mm": 10, "min_spacing_mm": 10, '
+        '"forbidden_zones": [{"signature_index": 1, '
+        '"intervals": [{"start_mm": NaN, "end_mm": 20}]}]}'
+    )
+    response = client.post(
+        "/api/v1/impose/staple-plan",
+        content=payload,
+        headers={"Content-Type": "application/json"},
+    )
+    assert response.status_code == 422
+
+
+def test_staple_plan_forbidden_zones_optional_and_extra_field_rejected():
+    response = client.post("/api/v1/impose/staple-plan", json=STAPLE_PLAN_BASE)
+    assert response.status_code == 200
+    response = client.post(
+        "/api/v1/impose/staple-plan", json={**STAPLE_PLAN_BASE, "extra": 1}
+    )
+    assert response.status_code == 422
+
+
+def test_staple_plan_impose_inputs_reused_for_validation():
+    for override in (
+        {"total_pages": 0},
+        {"max_sheets_per_signature": 0},
+        {"binding": "top"},
+    ):
+        body = {**STAPLE_PLAN_BASE, **override}
+        assert client.post("/api/v1/impose/staple-plan", json=body).status_code == 422
